@@ -1,0 +1,27 @@
+---
+- apparmor-profiles:
+    - '/usr/bin/onionshare'
+    - '/usr/bin/onionshare-gui'
+  users:
+    - 'amnesia'
+  commands:
+    GETINFO:
+      - 'version'
+      - 'onions/current'
+    ADD_ONION:
+      - 'NEW:BEST Flags=BasicAuth Port=1,1 ClientAuth=onionshare'
+      - 'NEW:(BEST|RSA1024) Port=80,176([0-4][0-9]|50)'
+      - 'NEW:(BEST|RSA1024) Flags=BasicAuth Port=80,176([0-4][0-9]|50) ClientAuth=onionshare'
+    DEL_ONION:
+      - '.+'
+    GETCONF:
+      - 'hiddenservicesinglehopmode'
+  confs:
+    __owningcontrollerprocess:
+  events:
+    SIGNAL:
+      suppress: true
+    CONF_CHANGED:
+      suppress: true
+    HS_DESC:
+    STATUS_SERVER:

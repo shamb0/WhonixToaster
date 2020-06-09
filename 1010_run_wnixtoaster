@@ -1,0 +1,366 @@
+#!/bin/bash
+
+set -e
+set -u
+set -o pipefail
+
+NAME=$(basename "${0}")
+
+echo $NAME
+
+GENERAL_DEPENDENCIES="
+cucumber
+devscripts
+dnsmasq-base
+gawk
+git
+i18nspector
+imagemagick
+libcap2-bin
+libvirt-clients
+libvirt-daemon-system
+libvirt-dev
+libvirt0
+obfs4proxy
+openssh-server
+ovmf
+pry
+python-jabberbot
+python-potr
+qemu-kvm
+qemu-system-x86
+redir
+ruby-guestfs
+ruby-json
+ruby-libvirt
+ruby-packetfu
+ruby-rb-inotify
+ruby-rspec
+ruby-test-unit
+seabios
+tcpdump
+tcplay
+tor
+unclutter
+virt-viewer
+xdotool
+xvfb
+"
+
+if [ "$(lsb_release --short --codename)" = "stretch" ]; then
+    GENERAL_DEPENDENCIES="${GENERAL_DEPENDENCIES}
+libav-tools
+python-opencv
+python-pil
+"
+else
+    GENERAL_DEPENDENCIES="${GENERAL_DEPENDENCIES}
+ffmpeg
+python3-opencv
+python3-pil
+"
+fi
+
+usage() {
+    echo "Usage: $NAME [OPTION]... [--] [CUCUMBER_ARGS]...
+Sets up an appropriate environment and invokes cucumber. Note that this script
+must be run from the Tails source directory root.
+
+Options for '@product' features:
+  --allow-non-root   Normally the test suite must be run as root, but if you
+                     really know what you are doing this option allows any
+                     user to run it.
+  --artifacts-base-uri URI
+                     Pretend that the artifact is located at URI when printing
+                     its location during a scenario failure. This is useful if
+                     you intend to serve the artifacts via the web, for
+                     instance.
+  --capture          Captures failed scenarios into videos stored in the
+                     temporary directory (see --tmpdir below) using x264
+                     encoding. Requires x264.
+  --capture-all      Keep videos for all scenarios, including those that
+                     succeed (implies --capture).
+  --interactive-debugging
+                     On failure, pause test suite until pressing Enter. Also
+                     offer the option to open an interactive Ruby shell (pry)
+                     in the Cucumber world's context.
+  --image-bumping-mode
+                     When any image matching fails, enter an interactive mode
+                     that allows to update the image. If run from a graphical
+                     environment, any found candidate image will be displayed
+                     in a pop-up.
+  --keep-chutney     Don't ever clean Chutney data directory.
+                     This can be a big time saver when debugging steps
+                     when --keep-snapshots is not an option.
+  --keep-snapshots   Don't ever delete any snapshots (including ones marked as
+                     temporary). This can be a big time saver when debugging new
+                     features. Implies --keep-chutney.
+  --tmpdir           Directory where various temporary files are written
+                     during a test, e.g. VM snapshots and memory dumps,
+                     failure screenshots, pcap files and disk images
+                     (default is TMPDIR in the environment, and if unset,
+                     /tmp/TailsToaster).
+  --view             Shows the test session in a windows. Requires x11vnc
+                     and tigervnc-viewer.
+  --vnc-server-only  Starts a VNC server for the test session. Requires x11vnc.
+
+Note that '@source' features has no relevant options.
+
+CUCUMBER_ARGS can be used to specify which features to be run, but also any
+cucumber option, although then you must pass \`--\` first to let this wrapper
+script know that we're done with *its* options. For debugging purposes, a
+'debug' formatter has been added so pretty debugging can be enabled with
+\`--format debug\`. You could even combine the default (pretty) formatter with
+pretty debugging printed to a file with \`--format pretty --format debug
+--out debug.log\`.
+"
+}
+
+error() {
+    echo "${NAME}: error: ${*}" >&2
+    exit 1
+}
+
+package_installed() {
+    local ret
+    set +o pipefail
+    if dpkg -s "${1}" 2>/dev/null | grep -q "^Status:.*installed"; then
+        ret=0
+    else
+        ret=1
+    fi
+    set -o pipefail
+    return ${ret}
+}
+
+check_dependencies() {
+    while [ -n "${1:-}" ]; do
+        if ! which "${1}" >/dev/null && ! package_installed "${1}" ; then
+            error "'${1}' is missing, please install it and run again."
+        fi
+        shift
+    done
+}
+
+display_in_use() {
+    [ -e "/tmp/.X${1#:}-lock" ] || [ -e "/tmp/.X11-unix/X${1#:}" ]
+}
+
+next_free_display() {
+    display_nr=0
+    while display_in_use ":${display_nr}"; do
+	display_nr=$((display_nr+1))
+    done
+    echo ":${display_nr}"
+}
+
+test_suite_cleanup() {
+
+    echo "System Exit Clean-up !!!"
+
+    stop_wnix_system
+
+    if [ -n "${XVFB_PID:-}" ]; then
+        (kill -0 "${XVFB_PID}" 2>/dev/null && kill "${XVFB_PID}") || /bin/true
+    fi
+    
+    return $?
+}
+
+start_xvfb() {
+    Xvfb "$TARGET_DISPLAY" -screen 0 1024x768x24+32 >/dev/null 2>&1 &
+    XVFB_PID=$!
+    # Wait for Xvfb to run on TARGET_DISPLAY
+    until display_in_use "$TARGET_DISPLAY"; do
+	sleep 1
+    done
+    echo "Virtual X framebuffer started on display ${TARGET_DISPLAY}"
+    # Hide the mouse cursor so it won't be in the way when we are
+    # trying to match images.
+    unclutter -display "$TARGET_DISPLAY" -root -idle 0.1 >/dev/null 2>&1 &
+}
+
+start_vnc_server() {
+    check_dependencies x11vnc
+    VNC_SERVER_PORT="$(x11vnc -listen localhost -display "${TARGET_DISPLAY}" \
+                              -bg -nopw -forever 2>&1 | \
+                                  grep -m 1 "^PORT=[0-9]\+" | sed 's/^PORT=//')"
+    echo "VNC server running on: localhost:${VNC_SERVER_PORT}"
+}
+
+start_vnc_viewer() {
+    check_dependencies tigervnc-viewer
+    xtigervncviewer \
+        -nojpeg -viewonly \
+        -RemoteResize=0 \
+        -AcceptClipboard=0 \
+        -SendClipboard=0 \
+        -SetPrimary=0 \
+        -SendPrimary=0 \
+        "localhost:${VNC_SERVER_PORT}" 1>/dev/null 2>&1 &
+}
+
+start_wnix_system() {
+
+    virsh -c qemu:///system start $KVM_DOMAIN_WHONIX_GW
+    virsh -c qemu:///system start $KVM_DOMAIN_WHONIX_WS
+    virsh -c qemu:///system list --all
+
+}
+
+stop_wnix_system() {
+    
+    if ! virsh -c qemu:///system domstate --domain $KVM_DOMAIN_WHONIX_GW | grep -i "shut off"; then
+        virsh -c qemu:///system destroy $KVM_DOMAIN_WHONIX_GW
+        sleep 3
+    else
+        echo $(virsh -c qemu:///system domstate --domain $KVM_DOMAIN_WHONIX_GW)
+    fi
+
+    if ! virsh -c qemu:///system domstate --domain $KVM_DOMAIN_WHONIX_WS | grep -i "shut off"; then
+        virsh -c qemu:///system destroy $KVM_DOMAIN_WHONIX_WS
+        sleep 3
+    else
+        echo $(virsh -c qemu:///system domstate --domain $KVM_DOMAIN_WHONIX_WS)
+    fi
+    
+    virsh -c qemu:///system list --all
+}
+
+# main script
+
+# Unset all environment variables used by this script to pass options
+# to cucumber, except TMPDIR since we explicitly want to support
+# setting it that way.
+ALLOW_NON_ROOT=
+ARTIFACTS_BASE_URI=
+CAPTURE=
+CAPTURE_ALL=
+VNC_VIEWER=
+VNC_SERVER=
+INTERACTIVE_DEBUGGING=
+IMAGE_BUMPING_MODE=
+KEEP_CHUTNEY=
+KEEP_SNAPSHOTS=
+TAILS_ISO=
+OLD_TAILS_ISO=
+
+KVM_DOMAIN_WHONIX_WS=Whonix-Workstation
+KVM_DOMAIN_WHONIX_GW=Whonix-Gateway
+KVM_NET_WHONIX_EXT=Whonix-External
+KVM_NET_WHONIX_INT=Whonix-Internal
+PART_2_ARGS=
+
+parse_args(){
+
+  LONGOPTS="allow-non-root,artifacts-base-uri:,view,vnc-server-only,capture,capture-all,help,tmpdir:,keep-chutney,keep-snapshots,interactive-debugging,image-bumping-mode"
+  OPTS=$(getopt -o "" --longoptions $LONGOPTS -n "${NAME}" -- "$@")
+  eval set -- "$OPTS"
+  while [ $# -gt 0 ]; do
+      case $1 in
+          --allow-non-root)
+              ALLOW_NON_ROOT="yes"
+              ;;
+          --artifacts-base-uri)
+              shift
+              export ARTIFACTS_BASE_URI="${1}"
+              ;;
+          --view)
+              VNC_VIEWER=yes
+              VNC_SERVER=yes
+              ;;
+          --vnc-server-only)
+              VNC_VIEWER=
+              VNC_SERVER=yes
+              ;;
+          --capture)
+              check_dependencies x264
+              export CAPTURE="yes"
+              ;;
+          --capture-all)
+              check_dependencies x264
+              export CAPTURE="yes"
+              export CAPTURE_ALL="yes"
+              ;;
+          --interactive-debugging)
+              export INTERACTIVE_DEBUGGING="yes"
+              ;;
+          --image-bumping-mode)
+              export IMAGE_BUMPING_MODE="yes"
+              ;;
+          --keep-chutney)
+              export KEEP_CHUTNEY="yes"
+              ;;
+          --keep-snapshots)
+              export KEEP_CHUTNEY="yes"
+              export KEEP_SNAPSHOTS="yes"
+              ;;
+          --tmpdir)
+              shift
+              export TMPDIR="$(readlink -f "$1")"
+              ;;
+          --help)
+          usage
+              exit 0
+              ;;
+          --)
+              shift
+              break
+              ;;
+      esac
+      shift
+  done
+
+  PART_2_ARGS="${@}"
+
+}
+
+main(){
+
+    trap "test_suite_cleanup" EXIT HUP INT QUIT TERM
+
+    check_dependencies ${GENERAL_DEPENDENCIES}
+
+    echo "${@}"
+
+    parse_args "${@}"
+
+    if [ "${EUID}" -ne 0 ] && [ -z "${ALLOW_NON_ROOT}" ]; then
+        error "you are not running as root; if you really know what you are" \
+              "doing, see the --allow-non-root option"
+    fi
+
+    TARGET_DISPLAY=$(next_free_display)
+
+    start_xvfb
+
+    if [ -n "${VNC_SERVER:-}" ]; then
+        start_vnc_server
+    fi
+    
+    if [ -n "${VNC_VIEWER:-}" ]; then
+        start_vnc_viewer
+    fi
+
+    export DISPLAY=${TARGET_DISPLAY}
+    export USER_DISPLAY="${DISPLAY:-}"
+
+    start_wnix_system
+
+    echo "${PART_2_ARGS}"
+    cucumber "${PART_2_ARGS}"
+
+    loopi=0
+
+    while :
+    do
+        sleep 1
+        loopi=$(( $loopi + 1 ))
+    done
+
+    echo "Bye bye !!!";
+
+}
+
+main "${@}"
+

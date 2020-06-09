@@ -1,0 +1,151 @@
+From: intrigeri <intrigeri@boum.org>
+Date: Sun, 16 Feb 2020 09:23:28 +0000
+Subject: [PATCH] Add pref for whether we accept OAuth2 during
+ autoconfiguration.
+
+For many providers JavaScript is required for OAuth2 to work; with it
+disabled autoconfiguration then result in a terrible UX (e.g. the web
+login fails, has to manually alter the authentication method). Let's
+provide a pref that discards OAuth2 configurations so e.g. extensions
+that disables JavaScript (like TorBirdy) can provide a workaround.
+
+Original author: anonym <anonym@riseup.net>
+---
+ .../accountcreation/content/emailWizard.js         | 64 ++++++++++++----------
+ .../accountcreation/content/readFromXML.js         | 13 +++++
+ comm/mailnews/mailnews.js                          |  2 +
+ 3 files changed, 49 insertions(+), 30 deletions(-)
+
+diff --git a/comm/mail/components/accountcreation/content/emailWizard.js b/comm/mail/components/accountcreation/content/emailWizard.js
+index 3780792..86bef64 100644
+--- a/comm/mail/components/accountcreation/content/emailWizard.js
++++ b/comm/mail/components/accountcreation/content/emailWizard.js
+@@ -1432,21 +1432,23 @@ EmailConfigWizard.prototype = {
+     }
+     this.fillPortDropdown(config.incoming.type);
+ 
+-    // If the incoming server hostname supports OAuth2, enable OAuth2 for it.
+-    let iDetails = OAuth2Providers.getHostnameDetails(config.incoming.hostname);
+-    e("in-authMethod-oauth2").hidden = !iDetails;
+-    if (iDetails) {
+-      gEmailWizardLogger.info(
+-        "OAuth2 details for incoming server " +
+-          config.incoming.hostname +
+-          " is " +
+-          iDetails
+-      );
+-      config.oauthSettings = {};
+-      [config.oauthSettings.issuer, config.oauthSettings.scope] = iDetails;
+-      // oauthsettings are not stored nor changeable in the user interface, so just
+-      // store them in the base configuration.
+-      this._currentConfig.oauthSettings = config.oauthSettings;
++    if (Services.prefs.getBoolPref("mailnews.auto_config.account_constraints.allow_oauth2")) {
++      // If the incoming server hostname supports OAuth2, enable OAuth2 for it.
++      let iDetails = OAuth2Providers.getHostnameDetails(config.incoming.hostname);
++      e("in-authMethod-oauth2").hidden = !iDetails;
++      if (iDetails) {
++        gEmailWizardLogger.info(
++          "OAuth2 details for incoming server " +
++            config.incoming.hostname +
++            " is " +
++            iDetails
++        );
++        config.oauthSettings = {};
++        [config.oauthSettings.issuer, config.oauthSettings.scope] = iDetails;
++        // oauthsettings are not stored nor changeable in the user interface, so just
++        // store them in the base configuration.
++        this._currentConfig.oauthSettings = config.oauthSettings;
++      }
+     }
+ 
+     // outgoing server
+@@ -1471,21 +1473,23 @@ EmailConfigWizard.prototype = {
+       this.adjustOutgoingPortToSSLAndProtocol(config);
+     }
+ 
+-    // If the smtp hostname supports OAuth2, enable OAuth2 for it.
+-    let oDetails = OAuth2Providers.getHostnameDetails(config.outgoing.hostname);
+-    e("out-authMethod-oauth2").hidden = !oDetails;
+-    if (oDetails) {
+-      gEmailWizardLogger.info(
+-        "OAuth2 details for outgoing server " +
+-          config.outgoing.hostname +
+-          " is " +
+-          oDetails
+-      );
+-      config.oauthSettings = {};
+-      [config.oauthSettings.issuer, config.oauthSettings.scope] = oDetails;
+-      // oauthsettings are not stored nor changeable in the user interface, so just
+-      // store them in the base configuration.
+-      this._currentConfig.oauthSettings = config.oauthSettings;
++    if (Services.prefs.getBoolPref("mailnews.auto_config.account_constraints.allow_oauth2")) {
++      // If the smtp hostname supports OAuth2, enable OAuth2 for it.
++      let oDetails = OAuth2Providers.getHostnameDetails(config.outgoing.hostname);
++      e("out-authMethod-oauth2").hidden = !oDetails;
++      if (oDetails) {
++        gEmailWizardLogger.info(
++          "OAuth2 details for outgoing server " +
++            config.outgoing.hostname +
++            " is " +
++            oDetails
++        );
++        config.oauthSettings = {};
++        [config.oauthSettings.issuer, config.oauthSettings.scope] = oDetails;
++        // oauthsettings are not stored nor changeable in the user interface, so just
++        // store them in the base configuration.
++        this._currentConfig.oauthSettings = config.oauthSettings;
++      }
+     }
+ 
+     // populate fields even if existingServerKey, in case user changes back
+diff --git a/comm/mail/components/accountcreation/content/readFromXML.js b/comm/mail/components/accountcreation/content/readFromXML.js
+index 8c7ecdd..780229f 100644
+--- a/comm/mail/components/accountcreation/content/readFromXML.js
++++ b/comm/mail/components/accountcreation/content/readFromXML.js
+@@ -32,6 +32,8 @@ function readFromXML(clientConfigXML) {
+   function array_or_undef(value) {
+     return value === undefined ? [] : value;
+   }
++  var allow_oauth2 =
++    Services.prefs.getBoolPref("mailnews.auto_config.account_constraints.allow_oauth2");
+   var exception;
+   if (
+     typeof clientConfigXML != "object" ||
+@@ -126,6 +128,12 @@ function readFromXML(clientConfigXML) {
+             NTLM: Ci.nsMsgAuthMethod.NTLM,
+             OAuth2: Ci.nsMsgAuthMethod.OAuth2,
+           });
++
++          if (!allow_oauth2 && iO.auth == Ci.nsMsgAuthMethod.OAuth2) {
++            iO.auth = null;
++            continue;
++          }
++
+           break; // take first that we support
+         } catch (e) {
+           exception = e;
+@@ -269,6 +277,11 @@ function readFromXML(clientConfigXML) {
+             OAuth2: Ci.nsMsgAuthMethod.OAuth2,
+           });
+ 
++          if (!allow_oauth2 && oO.auth == Ci.nsMsgAuthMethod.OAuth2) {
++            oO.auth = null;
++            continue;
++          }
++
+           break; // take first that we support
+         } catch (e) {
+           exception = e;
+diff --git a/comm/mailnews/mailnews.js b/comm/mailnews/mailnews.js
+index bde86d3..8f598b2 100644
+--- a/comm/mailnews/mailnews.js
++++ b/comm/mailnews/mailnews.js
+@@ -967,6 +967,8 @@ pref("mailnews.auto_config.guess.enabled", true);
+ pref("mailnews.auto_config.guess.sslOnly", false);
+ // The timeout (in seconds) for each guess
+ pref("mailnews.auto_config.guess.timeout", 10);
++// Whether we allow fetched configurations using OAuth2.
++pref("mailnews.auto_config.account_constraints.allow_oauth2", true);
+ // Work around bug 1454325 by disabling mimetype mungling in XmlHttpRequest
+ pref("dom.xhr.standard_content_type_normalization", false);
+ 

@@ -1,0 +1,32 @@
+#!/bin/bash
+
+main() {
+
+    KVM_NET_WHONIX_EXT=Whonix-External
+    KVM_NET_WHONIX_INT=Whonix-Internal
+
+    if [ "${EUID}" -ne 0 ] ; then
+        echo "Run the script as root."
+    else
+        
+        ip link set enp0s3 down
+
+        if virsh -c qemu:///system net-info --network $KVM_NET_WHONIX_INT | grep -i "Active:         no";
+        then
+            virsh -c qemu:///system net-start --network $KVM_NET_WHONIX_INT
+        fi
+
+        if virsh -c qemu:///system net-info --network $KVM_NET_WHONIX_EXT | grep -i "Active:         no";
+        then
+            virsh -c qemu:///system net-start --network $KVM_NET_WHONIX_EXT
+        fi
+
+        ip link set enp0s3 up
+
+        virsh -c qemu:///system net-list --all
+
+    fi
+
+}
+
+main $@
